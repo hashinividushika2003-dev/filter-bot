@@ -1,0 +1,7 @@
+firebase_cred.json
+*.session
+*.session-journal
+importer_session*
+__pycache__/
+*.pyc
+.env
