@@ -1,8 +1,11 @@
 """
 bot.py  —  Telegram Filter Bot
 ───────────────────────────────
-Reads config from environment variables (for Railway/cloud hosting).
-For local use, create a .env file or set variables in your system.
+Features:
+  ✅ Forced channel subscription (blocks access until joined)
+  ✅ 3 private storage channels (searches all 3)
+  ✅ Firebase Firestore database
+  ✅ Forward videos directly from storage channels
 """
 
 import os
@@ -10,7 +13,7 @@ import json
 import logging
 import firebase_admin
 from firebase_admin import credentials, firestore
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatMember
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -20,16 +23,24 @@ from telegram.ext import (
     filters,
 )
 
-# ─── CONFIG (from environment variables) ───────────────────────────────────────
+# ─── CONFIG (environment variables) ───────────────────────────────────────────
 BOT_TOKEN       = os.environ["BOT_TOKEN"]
 ADMIN_IDS       = [int(x) for x in os.environ["ADMIN_IDS"].split(",")]
-CHANNEL_ID      = int(os.environ["CHANNEL_ID"])
 COLLECTION_NAME = os.environ.get("COLLECTION_NAME", "files")
 
-# Firebase credentials come as a JSON string in env var FIREBASE_CRED_JSON
-# (paste the entire firebase_cred.json content as one line)
-_firebase_cred_json = os.environ["FIREBASE_CRED_JSON"]
-_firebase_cred_dict = json.loads(_firebase_cred_json)
+# Public channel users MUST subscribe to (with or without @)
+# e.g. "mychannel"  →  set MUST_JOIN = mychannel  (no @ needed)
+MUST_JOIN       = os.environ["MUST_JOIN"]          # e.g. mychannel
+
+# 3 private storage channels — bot must be admin in all 3
+STORAGE_CHANNELS = [
+    int(os.environ["STORAGE_CHANNEL_1"]),
+    int(os.environ["STORAGE_CHANNEL_2"]),
+    int(os.environ["STORAGE_CHANNEL_3"]),
+]
+
+# Firebase credentials as JSON string
+_firebase_cred_dict = json.loads(os.environ["FIREBASE_CRED_JSON"])
 # ───────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -63,7 +74,87 @@ def is_admin(user_id: int) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CORE: Send file by forwarding from channel
+#  SUBSCRIPTION CHECK
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def is_subscribed(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Returns True if the user is a member of MUST_JOIN channel."""
+    try:
+        member = await context.bot.get_chat_member(
+            chat_id=f"@{MUST_JOIN}",
+            user_id=user_id,
+        )
+        return member.status in [
+            ChatMember.MEMBER,
+            ChatMember.OWNER,
+            ChatMember.ADMINISTRATOR,
+        ]
+    except Exception as e:
+        logger.warning(f"Subscription check failed for {user_id}: {e}")
+        return False
+
+
+async def send_subscribe_prompt(update: Update):
+    """Send a join button to the user and block their request."""
+    buttons = [[
+        InlineKeyboardButton(
+            "📢 Join Channel",
+            url=f"https://t.me/{MUST_JOIN}"
+        ),
+        InlineKeyboardButton(
+            "✅ I Joined",
+            callback_data="check_sub"
+        ),
+    ]]
+    await update.message.reply_text(
+        "⚠️ *Access Restricted!*\n\n"
+        "You must join our channel to use this bot.\n\n"
+        "1️⃣ Click *Join Channel*\n"
+        "2️⃣ Then click *I Joined* to continue",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode="Markdown",
+    )
+
+
+async def check_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle the 'I Joined' button press."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = update.effective_user.id
+
+    if await is_subscribed(user_id, context):
+        await query.message.edit_text(
+            "✅ *Access granted!*\n\nWelcome! Now type any movie name to search.",
+            parse_mode="Markdown",
+        )
+    else:
+        buttons = [[
+            InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{MUST_JOIN}"),
+            InlineKeyboardButton("✅ I Joined", callback_data="check_sub"),
+        ]]
+        await query.message.edit_text(
+            "❌ *You haven't joined yet!*\n\n"
+            "Please join the channel first, then click *I Joined*.",
+            reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode="Markdown",
+        )
+
+
+# ── Decorator-style guard — call this at the top of every user handler ─────────
+async def check_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Returns True if user can proceed. Sends prompt and returns False if not."""
+    user_id = update.effective_user.id
+    if is_admin(user_id):
+        return True  # Admins always bypass
+    if not await is_subscribed(user_id, context):
+        await send_subscribe_prompt(update)
+        return False
+    return True
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CORE: Send file — searches all 3 storage channels
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def _send_file_by_name(chat_id: int, name: str, context: ContextTypes.DEFAULT_TYPE):
@@ -74,7 +165,7 @@ async def _send_file_by_name(chat_id: int, name: str, context: ContextTypes.DEFA
 
     entry = doc.to_dict()
 
-    # Method 1: forward from channel using stored message ID (from bulk_import)
+    # Method 1: forward from whichever storage channel the file came from
     if "msg_id" in entry and "channel_id" in entry:
         try:
             await context.bot.forward_message(
@@ -84,9 +175,9 @@ async def _send_file_by_name(chat_id: int, name: str, context: ContextTypes.DEFA
             )
             return
         except Exception as e:
-            logger.warning(f"Forward failed for '{name}': {e} — trying file_id fallback")
+            logger.warning(f"Forward failed for '{name}': {e} — trying file_id")
 
-    # Method 2: send via file_id (for manually uploaded files via /upload)
+    # Method 2: file_id fallback (manually uploaded via /upload)
     if "file_id" in entry:
         try:
             await context.bot.send_video(
@@ -101,7 +192,7 @@ async def _send_file_by_name(chat_id: int, name: str, context: ContextTypes.DEFA
 
     await context.bot.send_message(
         chat_id,
-        f"❌ Could not deliver *{name}*. Please contact admin.",
+        "❌ Could not deliver the file. Please contact admin.",
         parse_mode="Markdown",
     )
 
@@ -143,9 +234,11 @@ async def _send_results(update: Update, context: ContextTypes.DEFAULT_TYPE, quer
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_subscription(update, context):
+        return
     await update.message.reply_text(
         "👋 *Welcome to Filter Bot!*\n\n"
-        "🎬 Type a movie or video name and I'll send it instantly.\n\n"
+        "🎬 Type any movie or video name and I'll send it instantly.\n\n"
         "📌 *Commands:*\n"
         "  /search `<name>` — keyword search\n"
         "  /list — browse all available files",
@@ -153,6 +246,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_subscription(update, context):
+        return
     admin_text = (
         "\n\n🔧 *Admin Commands:*\n"
         "  Reply to a video + `/upload Movie Name`\n"
@@ -166,6 +261,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_subscription(update, context):
+        return
     query = " ".join(context.args).strip()
     if not query:
         await update.message.reply_text("Usage: `/search Movie Name`", parse_mode="Markdown")
@@ -173,6 +270,8 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_results(update, context, query)
 
 async def list_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_subscription(update, context):
+        return
     all_files = get_all_files()
     if not all_files:
         await update.message.reply_text("📭 No files stored yet.")
@@ -200,6 +299,19 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     index   = int(parts[1])
     user_id = int(parts[2])
 
+    # Subscription check for button presses too
+    if not is_admin(user_id):
+        if not await is_subscribed(user_id, context):
+            buttons = [[
+                InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{MUST_JOIN}"),
+                InlineKeyboardButton("✅ I Joined", callback_data="check_sub"),
+            ]]
+            await query.message.reply_text(
+                "⚠️ Please join our channel first!",
+                reply_markup=InlineKeyboardMarkup(buttons),
+            )
+            return
+
     names = context.bot_data.get(f"results_{user_id}", [])
     if not names or index >= len(names):
         await query.message.reply_text("⚠️ Session expired. Please search again.")
@@ -209,6 +321,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_file_by_name(query.message.chat_id, name, context)
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_subscription(update, context):
+        return
     text = update.message.text.strip()
     await _send_results(update, context, text)
 
@@ -229,7 +343,7 @@ async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     name = " ".join(context.args).strip()
     if not name:
-        await update.message.reply_text("⚠️ Provide a name: `/upload Movie Name`", parse_mode="Markdown")
+        await update.message.reply_text("⚠️ `/upload Movie Name`", parse_mode="Markdown")
         return
     save_file(name, {
         "file_id":        replied.video.file_id,
@@ -278,6 +392,8 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("search", search_command))
     app.add_handler(CommandHandler("list", list_files))
+
+    app.add_handler(CallbackQueryHandler(check_sub_callback, pattern="^check_sub$"))
     app.add_handler(CallbackQueryHandler(button_callback, pattern=r"^si:"))
 
     app.add_handler(CommandHandler("upload", upload))
@@ -286,7 +402,7 @@ def main():
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    logger.info("✅ Bot running on Railway...")
+    logger.info("✅ Bot running with subscription gate + 3 storage channels...")
     app.run_polling()
 
 if __name__ == "__main__":
